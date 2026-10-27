@@ -1,107 +1,126 @@
 ﻿-- ============================================================================
--- 1. Ventas e ingresos netos consolidados por país (Histórico + Eventos Diarios)
+-- 1. Ventas brutas, devoluciones y ventas netas por país y mes (Moneda Normalizada)
 -- ============================================================================
-WITH historical_sales AS (
+WITH monthly_data AS (
     SELECT 
         country,
-        COUNT(DISTINCT invoice_no) AS total_orders,
+        DATE_TRUNC('month', event_time)::date AS sales_month,
+        COUNT(DISTINCT COALESCE(invoice_no, order_id)) AS total_orders,
         SUM(quantity) AS total_units_sold,
         ROUND(SUM(gross_amount_usd)::numeric, 2) AS total_gross_usd,
         ROUND(SUM(CASE WHEN is_return THEN gross_amount_usd ELSE 0 END)::numeric, 2) AS total_returns_usd,
         ROUND(SUM(gross_amount_usd)::numeric, 2) AS total_net_usd
     FROM analytical.fact_order_lines
-    GROUP BY country
-),
-daily_sales AS (
-    SELECT 
-        country,
-        COUNT(DISTINCT order_id) AS total_orders,
-        COUNT(*) AS total_units_sold,
-        ROUND(SUM(amount_usd)::numeric, 2) AS total_gross_usd,
-        ROUND(SUM(CASE WHEN event_type = 'refunded' THEN amount_usd ELSE 0 END)::numeric, 2) AS total_returns_usd,
-        ROUND(SUM(CASE WHEN event_type = 'refunded' THEN -amount_usd ELSE amount_usd END)::numeric, 2) AS total_net_usd
-    FROM analytical.fact_order_events
-    WHERE event_type IN ('paid', 'refunded', 'completed')
-    GROUP BY country
+    GROUP BY country, DATE_TRUNC('month', event_time)
 )
 SELECT 
-    COALESCE(h.country, d.country) AS country,
-    COALESCE(h.total_orders, 0) + COALESCE(d.total_orders, 0) AS total_orders,
-    COALESCE(h.total_net_usd, 0) + COALESCE(d.total_net_usd, 0) AS net_revenue_usd
-FROM historical_sales h
-FULL OUTER JOIN daily_sales d ON h.country = d.country
+    sales_month,
+    country,
+    total_orders,
+    total_gross_usd,
+    total_returns_usd,
+    total_net_usd
+FROM monthly_data
+ORDER BY sales_month DESC, total_net_usd DESC
+LIMIT 15;
+
+-- ============================================================================
+-- 2. Categorías con mayores ingresos y proporción de devoluciones
+-- ============================================================================
+SELECT 
+    COALESCE(p.category, 'Sin Categoría') AS category,
+    COUNT(DISTINCT COALESCE(l.invoice_no, l.order_id)) AS total_orders,
+    ROUND(SUM(l.gross_amount_usd)::numeric, 2) AS gross_revenue_usd,
+    ROUND(ABS(SUM(CASE WHEN l.is_return THEN l.gross_amount_usd ELSE 0 END))::numeric, 2) AS returns_amount_usd,
+    ROUND(
+        (COUNT(CASE WHEN l.is_return THEN 1 END)::numeric / NULLIF(COUNT(*), 0)) * 100, 
+        2
+    ) AS return_rate_pct
+FROM analytical.fact_order_lines l
+LEFT JOIN analytical.dim_product p ON l.sku = p.sku
+GROUP BY p.category
+ORDER BY gross_revenue_usd DESC;
+
+-- ============================================================================
+-- 3. Top 10 SKUs con mayor venta neta y Top 10 con mayor tasa de devolución
+-- ============================================================================
+-- Top 10 SKUs por Venta Neta
+SELECT 
+    l.sku,
+    COALESCE(p.product_name, 'No registrado en catálogo') AS product_name,
+    SUM(l.quantity) AS net_units_sold,
+    ROUND(SUM(l.gross_amount_usd)::numeric, 2) AS net_revenue_usd
+FROM analytical.fact_order_lines l
+LEFT JOIN analytical.dim_product p ON l.sku = p.sku
+GROUP BY l.sku, p.product_name
 ORDER BY net_revenue_usd DESC
 LIMIT 10;
 
--- ============================================================================
--- 2. Tasa de devoluciones por país y por línea de producto
--- ============================================================================
+-- Top 10 SKUs con más devoluciones (mínimo 50 movimientos)
 SELECT 
-    country,
-    COUNT(*) AS total_line_items,
-    COUNT(CASE WHEN is_return THEN 1 END) AS returned_items,
+    l.sku,
+    COALESCE(p.product_name, 'No registrado en catálogo') AS product_name,
+    COUNT(CASE WHEN l.is_return THEN 1 END) AS return_events_count,
     ROUND(
-        (COUNT(CASE WHEN is_return THEN 1 END)::numeric / NULLIF(COUNT(*), 0)) * 100, 
+        (COUNT(CASE WHEN l.is_return THEN 1 END)::numeric / NULLIF(COUNT(*), 0)) * 100, 
         2
-    ) AS return_rate_percentage,
-    ROUND(ABS(SUM(CASE WHEN is_return THEN gross_amount_usd ELSE 0 END))::numeric, 2) AS returned_amount_usd
-FROM analytical.fact_order_lines
-GROUP BY country
-HAVING COUNT(*) > 1000
-ORDER BY return_rate_percentage DESC
+    ) AS return_rate_pct,
+    ROUND(ABS(SUM(CASE WHEN l.is_return THEN l.gross_amount_usd ELSE 0 END))::numeric, 2) AS returned_amount_usd
+FROM analytical.fact_order_lines l
+LEFT JOIN analytical.dim_product p ON l.sku = p.sku
+GROUP BY l.sku, p.product_name
+HAVING COUNT(*) >= 50
+ORDER BY return_rate_pct DESC, returned_amount_usd DESC
 LIMIT 10;
 
 -- ============================================================================
--- 3. Análisis de eventos tardíos (Late Arrivals > 24h) y su impacto financiero
+-- 4. Tiempo promedio de creación a pago y proporción de pedidos cancelados
+-- ============================================================================
+WITH order_lifecycle AS (
+    SELECT 
+        order_id,
+        MIN(CASE WHEN event_type = 'created' THEN event_time END) AS created_time,
+        MIN(CASE WHEN event_type = 'paid' THEN event_time END) AS paid_time,
+        MAX(CASE WHEN event_type = 'cancelled' THEN 1 ELSE 0 END) AS is_cancelled
+    FROM analytical.fact_order_events
+    GROUP BY order_id
+)
+SELECT 
+    COUNT(*) AS total_tracked_orders,
+    ROUND(
+        AVG(EXTRACT(EPOCH FROM (paid_time - created_time)) / 60)::numeric, 
+        2
+    ) AS avg_minutes_created_to_paid,
+    SUM(is_cancelled) AS total_cancelled_orders,
+    ROUND(
+        (SUM(is_cancelled)::numeric / NULLIF(COUNT(*), 0)) * 100, 
+        2
+    ) AS cancellation_rate_pct
+FROM order_lifecycle;
+
+-- ============================================================================
+-- 5. Proporción de eventos tardíos (>24h) y estado de conciliación
 -- ============================================================================
 SELECT 
     is_late,
-    COUNT(*) AS event_count,
+    COUNT(*) AS total_events,
     ROUND((COUNT(*)::numeric / SUM(COUNT(*)) OVER ()) * 100, 2) AS percentage_of_total,
-    ROUND(SUM(amount_usd)::numeric, 2) AS total_amount_usd,
-    ROUND(AVG(amount_usd)::numeric, 2) AS avg_ticket_usd
+    ROUND(SUM(amount_usd)::numeric, 2) AS total_volume_usd
 FROM analytical.fact_order_events
 GROUP BY is_late;
 
 -- ============================================================================
--- 4. Métricas de calidad y auditoría por lote de ingesta
+-- 6. Porcentaje de rechazos por fuente y evolución en los últimos 7 lotes
 -- ============================================================================
 SELECT 
-    b.batch_id,
-    b.source_name,
-    b.batch_date,
-    b.rows_read,
-    b.rows_valid,
-    b.rows_rejected,
-    b.rows_duplicate,
-    b.rows_late,
-    ROUND((b.rows_rejected::numeric / NULLIF(b.rows_read, 0)) * 100, 2) AS rejection_rate_pct,
-    b.status
-FROM analytical.etl_batch_audit b
-ORDER BY b.batch_date DESC;
-
--- ============================================================================
--- 5. Causas principales de cuarentena (Data Quality Rules Violations)
--- ============================================================================
-SELECT 
+    batch_id,
     source_name,
-    rejection_reason,
-    COUNT(*) AS quarantined_count,
-    ROUND((COUNT(*)::numeric / SUM(COUNT(*)) OVER (PARTITION BY source_name)) * 100, 2) AS pct_within_source
-FROM analytical.quarantine_records
-GROUP BY source_name, rejection_reason
-ORDER BY source_name, quarantined_count DESC;
-
--- ============================================================================
--- 6. Rendimiento y precio promedio por categoría enriquecida desde la API Mock
--- ============================================================================
-SELECT 
-    p.category,
-    COUNT(DISTINCT p.sku) AS distinct_products_in_catalog,
-    ROUND(AVG(p.current_price)::numeric, 2) AS catalog_avg_price,
-    COALESCE(SUM(l.quantity), 0) AS total_units_sold,
-    COALESCE(ROUND(SUM(l.gross_amount_usd)::numeric, 2), 0) AS total_historical_sales_usd
-FROM analytical.dim_product p
-LEFT JOIN analytical.fact_order_lines l ON p.sku = l.stock_code
-GROUP BY p.category
-ORDER BY total_historical_sales_usd DESC;
+    batch_date,
+    rows_read,
+    rows_valid,
+    rows_rejected,
+    ROUND((rows_rejected::numeric / NULLIF(rows_read, 0)) * 100, 2) AS rejection_rate_pct,
+    status
+FROM analytical.etl_batch_audit
+ORDER BY batch_date DESC
+LIMIT 7;
